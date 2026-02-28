@@ -7,14 +7,15 @@ import torchtext
 import torchvision
 import transformers
 import concurrent.futures
-
+from src.datasets.fedif import FedIFGoldenDataset
 from src import TqdmToLogger, stratified_split
 from src.datasets import *
 from src.loaders.split import simulate_split
-
+import torchvision.transforms as transforms
 from transformers import BertTokenizer
-
-
+from torch.utils.data import Subset
+import json
+from src.robust_noise import gen_noisy_clients_vector, LabelNoiseWrapper, DataNoiseWrapper
 logger = logging.getLogger(__name__)
 
 MEANS = {
@@ -134,7 +135,7 @@ def load_dataset(args, server=False):
         return transform
     
     # method to construct per-client dataset
-    def _construct_dataset(raw_train, idx, sample_indices):
+    def _construct_dataset(raw_train, idx, sample_indices, gamma_c_i: float = 0.0):
         task = raw_train.task if hasattr(raw_train, 'task') else None
         modality = raw_train.modality if hasattr(raw_train, 'modality') else None
         name = raw_train.name if hasattr(raw_train, 'name') else None
@@ -147,8 +148,47 @@ def load_dataset(args, server=False):
                 training_set, test_set = torch.utils.data.random_split(subset, [len(subset) - int(len(subset) * args.test_size), int(len(subset) * args.test_size)])
             else: # classification
                 training_set, test_set = stratified_split(subset, args.test_size)
-                
+
         traininig_set = SubsetWrapper(training_set, f'< {str(idx).zfill(8)} > (train)')
+
+        # ✅ 把 client 噪声信息挂在 dataset 上（后面 server/client 会用到）
+        traininig_set.noise_gamma = float(gamma_c_i)
+        traininig_set.is_noisy = bool(gamma_c_i > 0)
+        traininig_set.noise_type = int(getattr(args, "noise", 0))
+
+        # ✅ 根据 noise 类型注入（只动训练集，不动 test）
+        if getattr(args, "noise", 0) == 1:
+            # LN 只对 classification 有意义
+            if (task == "cls") and (getattr(args, "num_classes", None) is not None) and gamma_c_i > 0:
+                traininig_set = LabelNoiseWrapper(
+                    traininig_set,
+                    num_classes=int(args.num_classes),
+                    gamma=float(gamma_c_i),
+                    seed=int(args.seed) + int(idx) * 13,
+                )
+                # wrapper 也保留这些字段
+                traininig_set.noise_gamma = float(gamma_c_i)
+                traininig_set.is_noisy = True
+                traininig_set.noise_type = 1
+
+        elif getattr(args, "noise", 0) == 2:
+            # DN：img/txt/img+txt 都可以用
+            if gamma_c_i > 0:
+                traininig_set = DataNoiseWrapper(
+                    traininig_set,
+                    modality=modality,
+                    gamma=float(gamma_c_i),
+                    mean=float(getattr(args, "level_n_mean", 0.0)),
+                    std=float(getattr(args, "level_n_std", 0.1)),
+                    seed=int(args.seed) + int(idx) * 17,
+                    clip_min=float(getattr(args, "noise_clip_min", -1.0)),
+                    clip_max=float(getattr(args, "noise_clip_max", 1.0)),
+                    txt_drop_prob=float(getattr(args, "txt_drop_prob", 0.1)),
+                    txt_pad_id=int(getattr(args, "txt_pad_id", 0)),
+                )
+                traininig_set.noise_gamma = float(gamma_c_i)
+                traininig_set.is_noisy = True
+                traininig_set.noise_type = 2
         if len(subset) * args.test_size > 0:
             test_set = SubsetWrapper(test_set, f'< {str(idx).zfill(8)} > (test)')
         else:
@@ -338,6 +378,7 @@ def load_dataset(args, server=False):
         logger.info(f'[SIMULATE] Create client datasets!')
         client_datasets = []
         validation_sets = []
+        gamma_c, gamma_s = gen_noisy_clients_vector(args, num_users=args.K)
         # with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.K, os.cpu_count() - 1)) as workhorse:
         for idx, sample_indices in TqdmToLogger(
             enumerate(split_map.values()), 
@@ -345,7 +386,7 @@ def load_dataset(args, server=False):
             desc=f'[SIMULATE] ...creating client datasets... ',
             total=len(split_map)
             ):
-            res = _construct_dataset(raw_train, idx, sample_indices)
+            res = _construct_dataset(raw_train, idx, sample_indices, gamma_c[idx])
             validation_sets.append(res[1])
             client_datasets.append(res) 
         logger.info(f'[SIMULATE] ...successfully created client datasets!')
@@ -359,66 +400,166 @@ def load_dataset(args, server=False):
                 augmented_datasets.append((client_dataset[0], holdout_sets[idx], client_dataset[2], client_dataset[3]))
             client_datasets = augmented_datasets
     gc.collect()
-    return raw_test, client_datasets, validation_sets    
+    return raw_test, client_datasets, validation_sets
+
+def load_index_golden(json_path, base_dataset):
+    with open(json_path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    return Subset(base_dataset, obj["indices"])
 
 def load_datasets(args):
-    """Fetch and split requested datasets.
-    
-    Args:
-        args: arguments
-        
-    Returns:
-        split_map: {client ID: [assigned sample indices]}
-            ex) {0: [indices_1], 1: [indices_2], ... , K: [indices_K]}
-        server_testset: (optional) holdout dataset located at the central server, 
-        client datasets: [(local training set, local test set)]
-            ex) [tuple(local_training_set[indices_1], local_test_set[indices_1]), tuple(local_training_set[indices_2], local_test_set[indices_2]), ...]
+    """Fetch and split requested datasets. Enhanced for FedIF."""
 
-    """
-    # //assert args.eval_type == 'local', 'PFL setting is required for mm.'
+    # [Fix 1] 保存原始数据根目录，防止在循环中 args.data_path 被修改导致后续路径错误
+    root_data_path = args.data_path
 
     datasets = args.datasets
     modalities = args.modalities
     data_paths = args.data_paths
-    # tasks = args.tasks # For now, one dataset only has one task. Add later if needed.
     num_clients = args.Ks
-    num_datasets = len(datasets) - 1 # Server is the last one
+    num_datasets = len(datasets) - 1  # Server is the last one
+
     if len(num_clients) == 1:
         num_clients = [num_clients[0]] * num_datasets
 
-
-    raw_test = None 
-    # //Server can't have a test set for different tasks, PFL setting. 
-    #  Validation Set from training set
-    
+    raw_test = None
     client_datasetss = []
-    validata_data = {}
+
+    # raw_tests 是一个字典，用于存储所有任务的验证集以及 FedIF 的黄金数据集
+    # 结构: {'CIFAR100': Dataset, 'AG_NEWS': Dataset, 'fedif_golden_v0': Dataset, ...}
     raw_tests = {}
+
+    # --- 1. 加载各个任务的数据集 ---
     for i in range(num_datasets):
         args.dataset = datasets[i]
-        args.data_path = data_paths[i]
+        args.data_path = data_paths[i]  # 这里修改了 args.data_path
         args.modality = modalities[i]
         args.K = int(num_clients[i])
+
+        # load_dataset 返回: raw_test, client_datasets, validation_sets
         server_dataset, client_datasets, validation_sets = load_dataset(args)
-        # validata_data[modalities[i]] = validation_sets[0] if not args.train_as_val else client_datasets[0][0] # Removed for current setting
+
+        # 将该任务的验证集放入字典
         raw_tests[datasets[i]] = server_dataset
+
         if i == 0:
-            # raw_tests = [raw_test]
             client_datasetss = client_datasets
         else:
-            # raw_tests.append(raw_test)
             for client_dataset in client_datasets:
                 client_datasetss.append(client_dataset)
 
-    # Server train and test
+    # --- 2. [新增] 加载多版本 FedIF 黄金数据集 ---
+    print(f"[Data] Scanning for FedIF Golden Sets in: {root_data_path}...")
+
+    # 准备 Tokenizer 和 Transform (只需初始化一次)
+    try:
+        # 尝试加载 BERT Tokenizer
+        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+        # 准备图像变换 (标准 ImageNet 归一化)
+        val_transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+    except Exception as e:
+        print(f"[Data] Warning: Failed to init tokenizer/transform for FedIF: {e}")
+        tokenizer = None
+        val_transform = None
+
+    if tokenizer and val_transform:
+        found_golden = False
+
+        # 搜索路径优先级：Coco目录 > Flickr目录 > 根目录
+        search_dirs = [
+            os.path.join(root_data_path, 'coco'),
+            os.path.join(root_data_path, 'flickr30k'),
+            root_data_path
+        ]
+
+        # A. 优先尝试查找多版本文件 (fedif_golden_set_v0.json, _v1.json ...)
+        for base_dir in search_dirs:
+            if not os.path.exists(base_dir): continue
+
+            versions_found = []
+            # 扫描 v0 到 v9
+            for v in range(10):
+                p = os.path.join(base_dir, f'fedif_golden_set_v{v}.json')
+                if os.path.exists(p) and os.path.isfile(p):
+                    versions_found.append((v, p))
+
+            if versions_found:
+                print(f"[Data] ★ Found {len(versions_found)} Golden Set versions in: {base_dir}")
+                for v, p in versions_found:
+                    key_name = f'fedif_golden_v{v}'  # e.g., fedif_golden_v0
+                    try:
+                        d_set = FedIFGoldenDataset(
+                            json_file=p,
+                            transform=val_transform,
+                            tokenizer=tokenizer,
+                            max_length=getattr(args, 'seq_len', 40)
+                        )
+                        raw_tests[key_name] = d_set
+                    except Exception as e:
+                        print(f"[Data] Failed to load {p}: {e}")
+
+                found_golden = True
+                break  # 找到了版本文件就不再搜其他目录
+
+        # B. 回退机制：如果没有找到版本文件，尝试找单文件 (fedif_golden_set.json)
+        if not found_golden:
+            target_golden_path = None
+            for p in [os.path.join(d, 'fedif_golden_set.json') for d in search_dirs]:
+                if os.path.exists(p) and os.path.isfile(p):
+                    target_golden_path = p
+                    break
+
+            if target_golden_path:
+                print(f"[Data] ★ Found single Golden Set: {target_golden_path}")
+                try:
+                    d_set = FedIFGoldenDataset(
+                        json_file=target_golden_path,
+                        transform=val_transform,
+                        tokenizer=tokenizer,
+                        max_length=getattr(args, 'seq_len', 40)
+                    )
+                    raw_tests['fedif_golden'] = d_set  # 使用旧 Key
+                except Exception as e:
+                    print(f"[Data] Failed to load {target_golden_path}: {e}")
+            else:
+                print("[Data] ⚠️ No FedIF Golden Set found. FedIF influence calculation may be skipped.")
+
+    # --- 3. 加载 Server 端数据 (最后一个 dataset) ---
+    gold_dir = os.path.join(root_data_path, "golden_cls")
+    if os.path.isdir(gold_dir):
+        print(f"[Data] Scanning for CLS Golden Sets in: {gold_dir}...")
+
+        # 注意：这里的 key 必须和 raw_tests 里 dataset 的 key 完全一致
+        # 你 raw_tests 的 key 是 datasets[i]（例如 "CIFAR100" / "AG_NEWS"）
+        if "CIFAR100" in raw_tests:
+            for v in range(10):
+                p = os.path.join(gold_dir, f"CIFAR100_golden_v{v}.json")
+                if os.path.exists(p):
+                    raw_tests[f"CIFAR100_golden_v{v}"] = load_index_golden(p, raw_tests["CIFAR100"])
+            print("[Data] Loaded CIFAR100 golden:", [k for k in raw_tests if "CIFAR100_golden" in k])
+
+        if "AG_NEWS" in raw_tests:
+            for v in range(10):
+                p = os.path.join(gold_dir, f"AG_NEWS_golden_v{v}.json")
+                if os.path.exists(p):
+                    raw_tests[f"AG_NEWS_golden_v{v}"] = load_index_golden(p, raw_tests["AG_NEWS"])
+            print("[Data] Loaded AG_NEWS golden:", [k for k in raw_tests if "AG_NEWS_golden" in k])
+    else:
+        print(f"[Data] No golden_cls folder found at {gold_dir}, skip CLS golden loading.")
     args.dataset = datasets[-1]
     args.data_path = data_paths[-1]
     args.modality = modalities[-1]
     args.K = 1
 
     server_datasets = load_dataset(args, server=True)
-    # validata_data[modalities[i]] = validation_sets[0] if not args.train_as_val else client_datasets[0][0] # Removed for current setting
-
     args.K = sum([int(num_client) for num_client in num_clients])
 
-    return (server_datasets, raw_tests), client_datasetss    
+    # --- 4. [Fix 2] 调整返回顺序 ---
+    # 返回 (raw_tests字典, server_datasets元组)
+    # 这样 FedifServer 拿到 datasets[0] 就是字典，datasets[1] 就是元组
+    return (raw_tests, server_datasets), client_datasetss
