@@ -209,8 +209,12 @@ if __name__ == "__main__":
     # FedIoT arguments    #
     ########################
     parser.add_argument('--mm_scale', type=float, default=100, help='coefficent for multi-modal clients')
-
-
+    parser.add_argument('--no_intra', action='store_true', help='Disable Intra-Weighting')
+    parser.add_argument('--no_sscf', action='store_true', help='Disable SSCF')
+    parser.add_argument('--soft_update_tau', type=float, default=0.5,
+                        help='Soft update factor for FedIF global aggregation (default: 0.5)')
+    parser.add_argument('--align_temp', type=float, default=0.2,
+                        help='Temperature for contrastive loss in FedIF (default: 0.2)')
 
     ###################
     # Model arguments #
@@ -237,7 +241,7 @@ if __name__ == "__main__":
     ######################
     ## federated learning settings
     parser.add_argument('--algorithm', help='federated learning algorithm to be used', type=str,
-        # choices=['fedavg', 'fedsgd', 'fedprox', 'fedavgm', 'vector', 'creamfl', 'fediot'], 
+         choices=['fedavg', 'fedsgd', 'fedprox', 'fedavgm', 'vector', 'creamfl', 'fedif','fediot'],
         required=True
     )
     parser.add_argument('--eval_type', help='''the evaluation type of a model trained from FL algorithm
@@ -263,20 +267,40 @@ if __name__ == "__main__":
     parser.add_argument('--B', help='local batch size (full-batch training when zero is passed)', type=int, default=10)
     parser.add_argument('--eval_batch_size', help='eval batch size (full-batch training when zero is passed)', type=int, default=64)
     parser.add_argument('--beta1', help='server momentum factor', type=float, choices=[Range(0., 1.)], default=0.)
-    
-    # optimization arguments
-    parser.add_argument('--no_shuffle', help='do not shuffle data when training (if passed)', action='store_true')
-    parser.add_argument('--optimizer', help='type of optimization method (NOTE: should be a sub-module of `torch.optim`, thus case-sensitive)', type=str, default='SGD', required=True)
-    parser.add_argument('--max_grad_norm', help='a constant required for gradient clipping', type=float, choices=[Range(0., float('inf'))], default=0.)
-    parser.add_argument('--weight_decay', help='weight decay (L2 penalty)', type=float, choices=[Range(0., 1.)], default=0)
-    parser.add_argument('--momentum', help='momentum factor', type=float, choices=[Range(0., 1.)], default=0.)
-    parser.add_argument('--nesterov', help='use Nesterov momentum (if passed)', action='store_true')
-    parser.add_argument('--lr', help='learning rate for local updates in each client', type=float, choices=[Range(0., 100.)], default=0.01, required=True)
-    parser.add_argument('--lr_decay', help='decay rate of learning rate', type=float, choices=[Range(0., 1.)], default=1.0)
-    parser.add_argument('--lr_decay_step', help='intervals of learning rate decay', type=int, default=20)
-    parser.add_argument('--criterion', help='objective function (NOTE: should be a submodule of `torch.nn`, thus case-sensitive)', type=str, required=True)
-    parser.add_argument('--mu', help='constant for proximity regularization term (valid only if the algorithm is `fedprox`)', type=float, choices=[Range(0., 1e6)], default=0.01)
+    # [Add this to main.py]
+    # FedIF arguments
+    parser.add_argument('--fedif_gamma', type=float, default=0.9,
+                        help='EMA decay factor for FedIF influence scores (default: 0.9)')
+    parser.add_argument('--enable_fisher', action='store_true',
+                        help='Enable client-side diagonal Fisher estimation for shared attention.')
+    parser.add_argument('--fisher_batches', type=int, default=2,
+                        help='How many local batches to estimate Fisher (small number is enough).')
+    parser.add_argument('--fisher_clip', type=float, default=10.0,
+                        help='Clip Fisher values to avoid numerical explosion.')
+    parser.add_argument('--fisher_norm_eps', type=float, default=1e-6,
+                        help='Eps for Fisher normalization.')
+    # noise benchmark
+    parser.add_argument('--noise', type=int, default=0)  # 0 clean, 1 LN, 2 DN, 3 GN, 4 ADV
+    parser.add_argument('--level_n_system', type=float, default=0.4)
+    parser.add_argument('--level_n_lowerb', type=float, default=0.5)
+    parser.add_argument('--level_n_upperb', type=float, default=0.7)
+    parser.add_argument('--level_n_mean', type=float, default=0.0)
+    parser.add_argument('--level_n_std', type=float, default=0.1)
 
+    # DN for text
+    parser.add_argument('--txt_drop_prob', type=float, default=0.1)
+    parser.add_argument('--txt_pad_id', type=int, default=0)
+    parser.add_argument('--noise_clip_min', type=float, default=-1.0)
+    parser.add_argument('--noise_clip_max', type=float, default=1.0)
+
+    # GN (recommended smaller than level_n_std)
+    parser.add_argument('--grad_n_mean', type=float, default=0.0)
+    parser.add_argument('--grad_n_std', type=float, default=1e-4)
+
+    # ADV
+    parser.add_argument('--adv_eps', type=float, default=0.03)
+    parser.add_argument('--adv_clip_min', type=float, default=-1.0)
+    parser.add_argument('--adv_clip_max', type=float, default=1.0)
     # parse arguments
     args = parser.parse_args()
     args.out_modality_scales = eval(args.out_modality_scales)
@@ -302,7 +326,7 @@ if __name__ == "__main__":
     # # define writer
     # writer = SummaryWriter(log_dir=os.path.join(args.log_path, f'{args.exp_name}_{curr_time}'), filename_suffix=f'_{curr_time}')
 
-    wandb.init(config=args,project='YOUR/PROJECT/NAME', entity='YOUR/ENTITY', name=f"{args.exp_name}{'_aux' if args.with_aux else ''}{'_attn' if args.with_aux and args.aux_attn_only else ''}{'_mlp' if args.with_aux and args.aux_mlp_only else ''}{'_'+str(args.aux_trained) if args.with_aux else ''}_{args.shared_param}_{args.share_scope}{'_comp' if args.compensation else ''}_{args.colearn_param}_{args.warmup_modality}_{args.freeze_modality}_{curr_time}")
+    wandb.init(config=args,project='fedcola', entity='cola', name=f"{args.exp_name}{'_aux' if args.with_aux else ''}{'_attn' if args.with_aux and args.aux_attn_only else ''}{'_mlp' if args.with_aux and args.aux_mlp_only else ''}{'_'+str(args.aux_trained) if args.with_aux else ''}_{args.shared_param}_{args.share_scope}{'_comp' if args.compensation else ''}_{args.colearn_param}_{args.warmup_modality}_{args.freeze_modality}_{curr_time}")
     # run main program
     torch.autograd.set_detect_anomaly(True)
     # try:
