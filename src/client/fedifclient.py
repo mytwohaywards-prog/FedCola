@@ -29,10 +29,8 @@ class FedifClient(FedavgClient):
         self.fisher_matrix = {}
 
     def download(self, models):
-        # 仍用父类下载
         super().download(models)
-        # 每轮清空，避免上一轮残留
-        self.fisher_matrix = {}
+
 
     def update(self):
         """
@@ -41,6 +39,9 @@ class FedifClient(FedavgClient):
         """
         result = super().update()
 
+        #  每轮 Fisher 从 0 开始（放这里更合理）
+        self.fisher_matrix = {}
+
         if self.enable_fisher and self.fisher_batches > 0:
             try:
                 self.fisher_matrix = self._compute_diag_fisher(max_batches=self.fisher_batches)
@@ -48,8 +49,8 @@ class FedifClient(FedavgClient):
                 logger.warning(f"[FedIFClient] Fisher compute failed on client {self.id}: {e}")
                 self.fisher_matrix = {}
 
+        logger.info(f"[FedIFClient {self.id}] fisher_keys={len(self.fisher_matrix)}")
         return result
-
     # -------------------------
     # Fisher helpers
     # -------------------------
@@ -93,7 +94,7 @@ class FedifClient(FedavgClient):
                 inputs, targets = batch
                 inputs = inputs.to(self.device)
                 targets = targets.to(self.device)
-                outputs = model([None, inputs])[0]
+                outputs = model([None, inputs])[1]
                 loss = self.criterion()(outputs.to(targets.device), targets)
 
             elif self.modality == "img+txt":
@@ -112,7 +113,7 @@ class FedifClient(FedavgClient):
                 # targets 在你当前对比学习实现里可能不用，但保持一致
                 targets = targets.to(self.device) if hasattr(targets, "to") else targets
 
-                outputs = model(inputs, task="img+txt")
+                outputs = model([inputs, targets], feat_out=True)
                 loss = self.criterion()(*outputs)
             else:
                 # 未知 modality：不算 Fisher

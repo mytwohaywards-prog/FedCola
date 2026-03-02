@@ -7,7 +7,7 @@ from src.criterions.segmentation_loss import SegLoss
 from .baseclient import BaseClient
 from src import MetricManager, TqdmToLogger
 from torch import nn
-
+from src.robust_noise import add_gradient_noise_state_dict, gen_adv_dataset_img
 import logging
 logger = logging.getLogger(__name__)
 
@@ -21,15 +21,19 @@ class FedavgClient(BaseClient):
         
         self.optim = torch.optim.__dict__[self.args.optimizer]
         self.criterion = nn.__dict__[criterion]
-
+        # ---- Robust noise metadata (copied from dataset) ----
+        self.noise_gamma = float(getattr(training_set, "noise_gamma", 0.0))
+        self.is_noisy = bool(getattr(training_set, "is_noisy", False))
+        self.noise_type = int(getattr(training_set, "noise_type", getattr(args, "noise", 0)))
         self.train_loader = self._create_dataloader(self.training_set, shuffle=not self.args.no_shuffle)
         self.test_loader = self._create_dataloader(self.test_set, shuffle=False, test=True)
 
         self.task = task
         self.modality = modality
         self.eval_metrics = eval_metrics
-
+        self._robust_injector = None
         self.writer = writer
+
 
     def _refine_optim_args(self, args):
         required_args = inspect.getfullargspec(self.optim)[0]
@@ -51,30 +55,50 @@ class FedavgClient(BaseClient):
                 return torch.utils.data.DataLoader(dataset=dataset, batch_size=self.args.B, shuffle=shuffle)
         else:
             return torch.utils.data.DataLoader(dataset=dataset, batch_size=self.args.B, shuffle=shuffle)
-        
+
     def update(self):
-        mm = MetricManager(self.eval_metrics) if self.modality!= 'img+txt' else MetricManager([])
+        mm = MetricManager(self.eval_metrics) if self.modality != 'img+txt' else MetricManager([])
         self.model.train()
         self.model.to(self.device)
 
         if self.args.distributed or (self.args.mm_distributed and self.modality == 'img+txt'):
             self.model = nn.DataParallel(self.model).cuda()
-        
+
         optimizer = self.optim(self.model.parameters(), **self._refine_optim_args(self.args))
+        train_loader = self.train_loader
+
+        # ✅ ADV：只对 img 分类任务做（先别对 txt / img+txt 动手）
+        if (
+                getattr(self.args, "noise", 0) == 4
+                and getattr(self, "is_noisy", False)
+                and getattr(self, "noise_gamma", 0.0) > 0
+                and self.modality == "img"
+        ):
+            adv_ds = gen_adv_dataset_img(
+                args=self.args,
+                model=(self.model.module if isinstance(self.model, nn.DataParallel) else self.model),  # 这里已经 .to(device) 且可能 DataParallel 了
+                dataset=self.training_set,
+                gamma=float(self.noise_gamma),
+                device=self.device,
+                batch_size=min(64, int(self.args.B) if int(self.args.B) > 0 else 64),
+            )
+            train_loader = torch.utils.data.DataLoader(
+                dataset=adv_ds,
+                batch_size=self.args.B,
+                shuffle=(not self.args.no_shuffle),
+            )
         logger.info(f'[{self.task.upper()}] [{self.modality.upper()}] ...working on client {self.id}... ')
         for e in TqdmToLogger(
-                    range(self.args.E), 
-                    logger=logger, 
-                    desc=f'[{self.task.upper()}] [{self.modality.upper()}] ...update client {self.id}... ',
-                    total=self.args.E
-                    ):
+                range(self.args.E),
+                logger=logger,
+                desc=f'[{self.task.upper()}] [{self.modality.upper()}] ...update client {self.id}... ',
+                total=self.args.E
+        ):
             num = 0
-            for batch in self.train_loader:
+            for batch in train_loader:
                 if num >= 2 and self.args.debug:
                     mm.aggregate(num * self.args.B, e + 1)
                     break
-
-
 
                 optimizer.zero_grad()
 
@@ -93,26 +117,29 @@ class FedavgClient(BaseClient):
                     inputs, targets = inputs.to(self.device), targets.to(self.device)
                     outputs = self.model([inputs, targets], feat_out=True)
                     loss = self.criterion()(*outputs)
-                    
+
                 loss.backward()
                 if self.args.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
                 optimizer.step()
 
-                mm.track(loss.item(), outputs.to(targets.device), targets) if self.modality!= 'img+txt' else mm.track(loss.item(), outputs[0].to(targets.device))
+                mm.track(loss.item(), outputs.to(targets.device), targets) if self.modality != 'img+txt' else mm.track(
+                    loss.item(), outputs[0].to(targets.device))
                 num += 1
             else:
                 mm.aggregate(len(self.training_set), e + 1)
-                res = mm.results[e+1]
-                # self.writer.log({f"Debug/client_{self.id}/loss": res["loss"], 
+                res = mm.results[e + 1]
+                # self.writer.log({f"Debug/client_{self.id}/loss": res["loss"],
                 #                  f"Debug/client_{self.id}/acc1": res["metrics"]["acc1"],
                 #                  }, e+1)
-                logger.info(f'[Client {self.id}] loss: {res["loss"]}, acc1: {res["metrics"]["acc1"]}') if self.modality!= 'img+txt' else logger.info(f'[Client {self.id}] loss: {res["loss"]}')
+                logger.info(
+                    f'[Client {self.id}] loss: {res["loss"]}, acc1: {res["metrics"]["acc1"]}') if self.modality != 'img+txt' else logger.info(
+                    f'[Client {self.id}] loss: {res["loss"]}')
         else:
             if self.args.distributed or (self.args.mm_distributed and self.modality == 'img+txt'):
                 self.model = self.model.module
             self.model.to('cpu')
-            
+
         return mm.results
 
     @torch.inference_mode()
@@ -155,6 +182,7 @@ class FedavgClient(BaseClient):
     def download(self, models):
         self.model = copy.deepcopy(models[self.dataset])
 
+
     def upload(self):
         # return itertools.chain.from_iterable([self.model.named_parameters(), self.model.named_buffers()])
         sd = self.model.cpu().state_dict()
@@ -166,23 +194,33 @@ class FedavgClient(BaseClient):
                     raise ValueError('Both aux_attn_only and aux_mlp_only cannot be True.')
                 layer_name = ('attn.qkv', 'attn.proj')
             elif self.args.aux_mlp_only:
-                layer_name = ('mlp.fc1','mlp.fc2')
+                layer_name = ('mlp.fc1', 'mlp.fc2')
             else:
-                layer_name = ('attn.qkv', 'attn.proj', 'mlp.fc1','mlp.fc2')
-            
+                layer_name = ('attn.qkv', 'attn.proj', 'mlp.fc1', 'mlp.fc2')
+
             with torch.no_grad():
-                for k,v in sd.items():
+                for k, v in sd.items():
                     if any([name in k for name in layer_name]):
                         if 'aux' not in k and 'weight' in k:
-                            new_sd[k] = v + new_sd[k.replace('weight', 'aux_weight')] * new_sd[k.replace('weight', 'cross_modal_scale')]
-                for k,v in sd.items():
+                            new_sd[k] = v + new_sd[k.replace('weight', 'aux_weight')] * new_sd[
+                                k.replace('weight', 'cross_modal_scale')]
+                for k, v in sd.items():
                     if 'aux' in k or 'cross_modal_scale' in k:
                         new_sd.pop(k)
-            return new_sd
+            to_send = new_sd
+        else:
+            to_send = sd
+        if getattr(self.args, "noise", 0) == 3 and getattr(self, "is_noisy", False) and getattr(self, "noise_gamma",
+                                                                                                0.0) > 0:
+            to_send = add_gradient_noise_state_dict(
+                args=self.args,
+                state_dict=to_send,
+                gamma=float(self.noise_gamma),
+                seed=int(self.args.seed) + int(self.id) * 1009,
+            )
 
+        return to_send
 
-        return sd
-    
     def __len__(self):
         return len(self.training_set)
 
