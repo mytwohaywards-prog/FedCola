@@ -877,7 +877,6 @@ class ModalityAgnosticTransformer(nn.Module):
 
         return new_sd
 
-
     def forward(self, x, feat_out=False):
         # _, C, _, _ = x.shape
 
@@ -890,11 +889,11 @@ class ModalityAgnosticTransformer(nn.Module):
                 assert x[i] is None, 'None modality should have None input.'
                 embeds.append(None)
                 continue
-            if len(x[i].shape)==4 and x[i].shape[1]==1:
-                x[i] = x[i].repeat(1,3,1,1)
+            if len(x[i].shape) == 4 and x[i].shape[1] == 1:
+                x[i] = x[i].repeat(1, 3, 1, 1)
 
             embeds.append(self.embeddings[i](x[i]))
-        
+
         # print(embeds[0].shape, embeds[1].shape)
 
         feats = [None for _ in range(len(self.modalities))]
