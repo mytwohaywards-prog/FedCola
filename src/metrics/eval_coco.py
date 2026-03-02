@@ -330,6 +330,8 @@ class COCOEvaluator(object):
 
             for idx, q_idx in enumerate(q_indices):
                 pos_indices = np.where(g_labels == q_labels[q_idx])[0]
+                if len(pos_indices) == 0:
+                    continue
                 _pred_ranks = [torch.where(pred_ranks[idx] == pos_idx)[0][0].item() for pos_idx in pos_indices]
                 best_pred_ranks[q_idx] = min(_pred_ranks)
 
