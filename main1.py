@@ -269,29 +269,6 @@ if __name__ == "__main__":
     parser.add_argument('--beta1', help='server momentum factor', type=float, choices=[Range(0., 1.)], default=0.)
     # [Add this to main.py]
     # FedIF arguments
-
-    # ---------------- Robustness (Noise) ----------------
-
-    # optimization arguments
-    parser.add_argument('--no_shuffle', help='do not shuffle data when training (if passed)', action='store_true')
-    parser.add_argument('--optimizer', help='type of optimization method (NOTE: should be a sub-module of `torch.optim`, thus case-sensitive)', type=str, default='SGD', required=True)
-    parser.add_argument('--max_grad_norm', help='a constant required for gradient clipping', type=float, choices=[Range(0., float('inf'))], default=0.)
-    parser.add_argument('--weight_decay', help='weight decay (L2 penalty)', type=float, choices=[Range(0., 1.)], default=0)
-    parser.add_argument('--momentum', help='momentum factor', type=float, choices=[Range(0., 1.)], default=0.)
-    parser.add_argument('--nesterov', help='use Nesterov momentum (if passed)', action='store_true')
-    parser.add_argument('--lr', help='learning rate for local updates in each client', type=float, choices=[Range(0., 100.)], default=0.01, required=True)
-    parser.add_argument('--lr_decay', help='decay rate of learning rate', type=float, choices=[Range(0., 1.)], default=1.0)
-    parser.add_argument('--lr_decay_step', help='intervals of learning rate decay', type=int, default=20)
-    parser.add_argument('--criterion', help='objective function (NOTE: should be a submodule of `torch.nn`, thus case-sensitive)', type=str, required=True)
-    parser.add_argument('--mu', help='constant for proximity regularization term (valid only if the algorithm is `fedprox`)', type=float, choices=[Range(0., 1e6)], default=0.01)
-    # noise benchmark
-    parser.add_argument('--noise', type=int, default=0)  # 0 clean, 1 LN, 2 DN, 3 GN, 4 ADV
-    parser.add_argument('--level_n_system', type=float, default=0.4)
-    parser.add_argument('--level_n_lowerb', type=float, default=0.5)
-    parser.add_argument('--level_n_upperb', type=float, default=0.7)
-    parser.add_argument('--level_n_mean', type=float, default=0.0)
-    parser.add_argument('--level_n_std', type=float, default=0.1)
-
     parser.add_argument('--fedif_gamma', type=float, default=0.9,
                         help='EMA decay factor for FedIF influence scores (default: 0.9)')
     parser.add_argument('--enable_fisher', action='store_true',
@@ -303,6 +280,12 @@ if __name__ == "__main__":
     parser.add_argument('--fisher_norm_eps', type=float, default=1e-6,
                         help='Eps for Fisher normalization.')
     # noise benchmark
+    parser.add_argument('--noise', type=int, default=0)  # 0 clean, 1 LN, 2 DN, 3 GN, 4 ADV
+    parser.add_argument('--level_n_system', type=float, default=0.4)
+    parser.add_argument('--level_n_lowerb', type=float, default=0.5)
+    parser.add_argument('--level_n_upperb', type=float, default=0.7)
+    parser.add_argument('--level_n_mean', type=float, default=0.0)
+    parser.add_argument('--level_n_std', type=float, default=0.1)
 
     # DN for text
     parser.add_argument('--txt_drop_prob', type=float, default=0.1)
