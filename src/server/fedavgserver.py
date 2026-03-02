@@ -144,15 +144,17 @@ class FedavgServer(BaseServer):
     def _init_model(self, model_str):
         self.args.datasets = self.args.datasets[:-1]
         models = {}
-        for i, dataset in enumerate(self.args.datasets): # CIFAR, AGNEWS, Flickr
-            # try:
+        for i, dataset in enumerate(self.args.datasets): # CIFAR, AGNEWS, F
+            if self.args.use_bert_tokenizer:
+                self.args.vocab_size = 30522
+            else:
                 self.args.vocab_size = VOCAB_SIZES[dataset] if dataset in VOCAB_SIZES else 30522
-                if DATASET_2_MODALITY[dataset] == 'img':
-                    models[dataset] = timm.create_model(model_str, pretrained=self.args.pretrained, num_classes=[NUM_CLASS[dataset], None], modalities=[self.args.modalities[i], None], args=self.args, tasks=[DATASET_2_TASK[dataset], None], with_aux=self.args.with_aux, aux_trained=self.args.aux_trained, aux_attn_only=self.args.aux_attn_only, aux_mlp_only=self.args.aux_mlp_only)
-                elif DATASET_2_MODALITY[dataset] == 'txt':
-                    models[dataset] = timm.create_model(model_str, pretrained=self.args.pretrained, num_classes=[None, NUM_CLASS[dataset]], modalities=[None, self.args.modalities[i]], args=self.args, tasks=[None, DATASET_2_TASK[dataset]], with_aux=self.args.with_aux, aux_trained=self.args.aux_trained, aux_attn_only=self.args.aux_attn_only, aux_mlp_only=self.args.aux_mlp_only)
-                elif DATASET_2_MODALITY[dataset] == 'img+txt':
-                    models[dataset] = timm.create_model(model_str, pretrained=self.args.pretrained, num_classes=[None, None], modalities=['img', 'txt'], args=self.args, tasks=[DATASET_2_TASK[dataset], DATASET_2_TASK[dataset]], with_aux=self.args.with_aux, aux_trained=self.args.aux_trained, aux_attn_only=self.args.aux_attn_only, aux_mlp_only=self.args.aux_mlp_only)
+            if DATASET_2_MODALITY[dataset] == 'img':
+                 models[dataset] = timm.create_model(model_str, pretrained=self.args.pretrained, num_classes=[NUM_CLASS[dataset], None], modalities=[self.args.modalities[i], None], args=self.args, tasks=[DATASET_2_TASK[dataset], None], with_aux=self.args.with_aux, aux_trained=self.args.aux_trained, aux_attn_only=self.args.aux_attn_only, aux_mlp_only=self.args.aux_mlp_only)
+            elif DATASET_2_MODALITY[dataset] == 'txt':
+                models[dataset] = timm.create_model(model_str, pretrained=self.args.pretrained, num_classes=[None, NUM_CLASS[dataset]], modalities=[None, self.args.modalities[i]], args=self.args, tasks=[None, DATASET_2_TASK[dataset]], with_aux=self.args.with_aux, aux_trained=self.args.aux_trained, aux_attn_only=self.args.aux_attn_only, aux_mlp_only=self.args.aux_mlp_only)
+            elif DATASET_2_MODALITY[dataset] == 'img+txt':
+                models[dataset] = timm.create_model(model_str, pretrained=self.args.pretrained, num_classes=[None, None], modalities=['img', 'txt'], args=self.args, tasks=[DATASET_2_TASK[dataset], DATASET_2_TASK[dataset]], with_aux=self.args.with_aux, aux_trained=self.args.aux_trained, aux_attn_only=self.args.aux_attn_only, aux_mlp_only=self.args.aux_mlp_only)
             # except:
                 # models[dataset] = timm.create_model(model_str, pretrained=self.args.pretrained, num_classes=NUM_CLASS[dataset])
         return models
@@ -168,11 +170,13 @@ class FedavgServer(BaseServer):
             model.load_state_dict(new_sd, strict=False)
     
     def _set_loaders(self, datasets):
-        self.server_dataset = datasets[1] #uni-modal datasets
-        # self.server_dataset_name = datasets[0][0].name
-        # self.server_modality = datasets[0][0].modality
-        # self.train_loader = torch.utils.data.DataLoader(dataset=datasets[0][0], batch_size=self.args.B, shuffle=True)
-        # self.test_loader = torch.utils.data.DataLoader(dataset=datasets[0][1], batch_size=self.args.B, shuffle=False)
+        # 自动判断哪个是字典（raw_tests），防止顺序变化导致的错误
+        if isinstance(datasets[0], dict):
+            self.server_dataset = datasets[0]
+        elif isinstance(datasets[1], dict):
+            self.server_dataset = datasets[1]
+        else:
+            raise ValueError("Expected a dictionary in server_dataset for raw_tests, but found None.")
 
     def _set_evaluator(self):
 
@@ -255,6 +259,9 @@ class FedavgServer(BaseServer):
             client.id = identifier
             client.dataset = datasets[4]
             client.device = 'cuda:%d' % (identifier % torch.cuda.device_count()) if torch.cuda.is_available() else 'cpu'
+            client.noise_gamma = float(getattr(datasets[0], "noise_gamma", 0.0))
+            client.is_noisy = bool(getattr(datasets[0], "is_noisy", False))
+            client.noise_type = int(getattr(datasets[0], "noise_type", getattr(self.args, "noise", 0)))
             # client.device = 'cuda:0' 
             return client
 
@@ -679,12 +686,15 @@ class FedavgServer(BaseServer):
         # Unimodal eval
         for dataset in self.server_dataset.keys():
             # logger.info(f'[{self.args.algorithm.upper()}] [{dataset.upper()}] [Round: {str(self.round).zfill(4)}] ...start to evaluate {dataset.upper()}!')
+            if dataset not in DATASET_2_MODALITY:
+                continue
+
 
             if DATASET_2_MODALITY[dataset]== 'img+txt':
                 self.global_model = self.global_models[dataset]
                 self.evaluator.set_model(self.global_model)
                 server_dataset = self.server_dataset[dataset]
-                result = self.evaluator.evaluate(torch.utils.data.DataLoader(dataset=server_dataset, batch_size=self.args.eval_batch_size, shuffle=True, num_workers=4, persistent_workers=True), eval_batch_size=self.args.eval_batch_size)
+                result = self.evaluator.evaluate(torch.utils.data.DataLoader(dataset=server_dataset, batch_size=self.args.eval_batch_size, shuffle=False, num_workers=4, persistent_workers=True), eval_batch_size=self.args.eval_batch_size)
                 server_log_string = f'[{self.args.algorithm.upper()}] [{dataset.upper()}] [Round: {str(self.round).zfill(4)}] [EVALUATE] [SERVER] '
 
                 res_dict = {}

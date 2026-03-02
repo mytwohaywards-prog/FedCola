@@ -286,7 +286,17 @@ class FedifServer(FedavgServer):
         model.zero_grad(set_to_none=True)
 
         # criterion: CrossEntropyLoss
-        criterion = self.criterions[dataset_name]()
+        task = DATASET_2_TASK.get(dataset_name, "cls")  # CIFAR100/AG_NEWS 都是 cls
+        criterion_name = TASK_2_CRITERION.get(task, "CrossEntropyLoss")
+
+        if hasattr(src.criterions, criterion_name):
+            criterion_cls = getattr(src.criterions, criterion_name)
+        elif hasattr(nn, criterion_name):
+            criterion_cls = getattr(nn, criterion_name)
+        else:
+            criterion_cls = nn.CrossEntropyLoss
+
+        criterion = criterion_cls().to(self.server_device)
         loader = self.anchor_val_loaders.get(dataset_name, None)
         if loader is None:
             print(f"[FedIF] No anchor loader for {dataset_name}, skip g_val.")
@@ -654,9 +664,7 @@ class FedifServer(FedavgServer):
         """
         assert set(updated_sizes.keys()) == set(ids)
         # ===== 新增：取检索 anchor（mm）梯度，用于 hard constraint =====
-        ret_grads = None
-        if isinstance(val_grads_pack, dict) and getattr(self, "mm_dataset_name", None) in val_grads_pack:
-            ret_grads = val_grads_pack[self.mm_dataset_name]
+
 
         # 软投影强度（分类约束的弱化）
         soft_beta = float(getattr(self.args, "fedif_soft_beta", 0.3))  # 推荐 0.2~0.3
@@ -682,6 +690,9 @@ class FedifServer(FedavgServer):
         # 没有 golden 梯度就退化为原聚合
         if not val_grads:
             return super(FedifServer, self)._aggregate(ids, updated_sizes, fedavg=fedavg)
+        ret_grads = None
+        if isinstance(val_grads_pack, dict) and getattr(self, "mm_dataset_name", None) in val_grads_pack:
+            ret_grads = val_grads_pack[self.mm_dataset_name]
 
         # -------------------------------
         # ✅ debug：只打印一次每个 (dataset|modality)
@@ -931,7 +942,7 @@ class FedifServer(FedavgServer):
         updated_sizes = self._request(selected_ids, eval=False, participated=True, retain_model=True, save_raw=False)
 
         # 3. FedIF 贡献评估 (训练后)
-        if self.round > 4:
+        if self.round > 2:
             val_grads_pack = self._calc_multi_anchor_validation_gradients()
             self._latest_val_grads = val_grads_pack
             self._update_influence_scores(selected_ids, val_grads_pack)
