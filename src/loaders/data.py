@@ -15,7 +15,7 @@ import torchvision.transforms as transforms
 from transformers import BertTokenizer
 from torch.utils.data import Subset
 import json
-from src.robust_noise import gen_noisy_clients_vector, LabelNoiseWrapper, DataNoiseWrapper
+from src.robust_noise import gen_noisy_clients_vector, LabelNoiseWrapper, DataNoiseWrapper,PairNoiseWrapper
 logger = logging.getLogger(__name__)
 
 MEANS = {
@@ -158,7 +158,7 @@ def load_dataset(args, server=False):
 
         # ✅ 根据 noise 类型注入（只动训练集，不动 test）
         if getattr(args, "noise", 0) == 1:
-            # LN 只对 classification 有意义
+            # 1) cls: Label Noise
             if (task == "cls") and (getattr(args, "num_classes", None) is not None) and gamma_c_i > 0:
                 traininig_set = LabelNoiseWrapper(
                     traininig_set,
@@ -166,7 +166,18 @@ def load_dataset(args, server=False):
                     gamma=float(gamma_c_i),
                     seed=int(args.seed) + int(idx) * 13,
                 )
-                # wrapper 也保留这些字段
+                traininig_set.noise_gamma = float(gamma_c_i)
+                traininig_set.is_noisy = True
+                traininig_set.noise_type = 1
+
+            # 2) rtv(img+txt): Pair Noise（COCO/Flickr）
+            elif (modality == "img+txt") and gamma_c_i > 0:
+                traininig_set = PairNoiseWrapper(
+                    traininig_set,
+                    gamma=float(gamma_c_i),
+                    seed=int(args.seed) + int(idx) * 13,
+                    mode="swap_txt",  # 先固定
+                )
                 traininig_set.noise_gamma = float(gamma_c_i)
                 traininig_set.is_noisy = True
                 traininig_set.noise_type = 1
