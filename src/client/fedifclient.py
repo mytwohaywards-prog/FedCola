@@ -24,6 +24,8 @@ class FedifClient(FedavgClient):
         self.fisher_batches = int(getattr(self.args, "fisher_batches", 2))
         self.fisher_clip = float(getattr(self.args, "fisher_clip", 10.0))
         self.fisher_norm_eps = float(getattr(self.args, "fisher_norm_eps", 1e-6))
+        self.fisher_trim_ratio = float(getattr(self.args, "fisher_trim_ratio", 0.2))
+        self.fisher_loss_temp = float(getattr(self.args, "fisher_loss_temp", 1.0))
 
         # server 会读取
         self.fisher_matrix = {}
@@ -73,7 +75,8 @@ class FedifClient(FedavgClient):
         model.train()
         model.to(self.device)
 
-        fisher = defaultdict(lambda: 0.0)
+        fisher_batches = []
+        loss_list = []
         used = 0
 
         for batch in self.train_loader:
@@ -121,27 +124,57 @@ class FedifClient(FedavgClient):
 
             loss.backward()
 
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.fisher_clip)
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                model.zero_grad(set_to_none=True)
+                continue
+
             # accumulate grad^2
+            fisher_snapshot = {}
             for n, p in model.named_parameters():
                 if (not p.requires_grad) or (p.grad is None):
                     continue
                 if not self._is_shared_attn_param(n):
                     continue
-                fisher[n] = fisher[n] + p.grad.detach().float().pow(2)
+                fisher_snapshot[n] = p.grad.detach().float().pow(2).cpu()
+
+            if fisher_snapshot:
+                fisher_batches.append(fisher_snapshot)
+                loss_list.append(float(loss.detach().cpu().item()))
 
             used += 1
 
-        if used == 0:
+        if used == 0 or len(fisher_batches) == 0:
             model.cpu()
             return {}
+
+        loss_arr = torch.tensor(loss_list, dtype=torch.float32)
+        trim_ratio = min(max(self.fisher_trim_ratio, 0.0), 0.8)
+
+        if len(loss_arr) > 1 and trim_ratio > 0:
+            cut = torch.quantile(loss_arr, q=max(1.0 - trim_ratio, 0.5)).item()
+            keep = (loss_arr <= cut).nonzero(as_tuple=False).flatten().tolist()
+        else:
+            keep = list(range(len(fisher_batches)))
+
+        if len(keep) == 0:
+            keep = [int(torch.argmin(loss_arr).item())]
+
+        fisher = defaultdict(lambda: 0.0)
+        kept_losses = torch.tensor([loss_list[i] for i in keep], dtype=torch.float32)
+        weights = torch.softmax(-kept_losses / max(self.fisher_loss_temp, 1e-6), dim=0)
+
+        for wi, batch_idx in zip(weights.tolist(), keep):
+            for n, v in fisher_batches[batch_idx].items():
+                fisher[n] = fisher[n] + v * float(wi)
 
         # mean + clip + cpu
         out = {}
         for n, v in fisher.items():
-            v = v / float(used)
             if self.fisher_clip > 0:
                 v = v.clamp(max=self.fisher_clip)
-            out[n] = v.detach().cpu()
+            scale = 1.0 / (1.0 + float(getattr(self, "noise_gamma", 0.0)))
+            out[n] = (v * scale).detach().cpu()
 
         model.cpu()
         return out

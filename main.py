@@ -302,6 +302,19 @@ if __name__ == "__main__":
                         help='Clip Fisher values to avoid numerical explosion.')
     parser.add_argument('--fisher_norm_eps', type=float, default=1e-6,
                         help='Eps for Fisher normalization.')
+    parser.add_argument('--fisher_trim_ratio', type=float, default=0.2,
+                        help='Trim high-loss batches when estimating client Fisher for noisy settings.')
+    parser.add_argument('--fisher_loss_temp', type=float, default=1.0,
+                        help='Temperature for loss-aware weighting when averaging Fisher batches.')
+
+    parser.add_argument('--fedif_noise_aware', action='store_true',
+                        help='Enable FedIF noise-aware trust reweighting during aggregation.')
+    parser.add_argument('--fedif_noise_penalty', type=float, default=1.5,
+                        help='Penalty strength for noisy clients when fedif_noise_aware is enabled.')
+    parser.add_argument('--fedif_trust_floor', type=float, default=0.2,
+                        help='Minimum trust weight for any client under noise-aware aggregation.')
+    parser.add_argument('--fedif_delta_clip', type=float, default=5.0,
+                        help='Adaptive delta-norm clipping scale for shared-attention parameters.')
     # noise benchmark
 
     # DN for text
@@ -319,6 +332,7 @@ if __name__ == "__main__":
     parser.add_argument('--adv_clip_min', type=float, default=-1.0)
     parser.add_argument('--adv_clip_max', type=float, default=1.0)
     # parse arguments
+    parser.set_defaults(fedif_noise_aware=True)
     args = parser.parse_args()
     args.out_modality_scales = eval(args.out_modality_scales)
     if len(args.out_modality_scales) == 1:
