@@ -568,6 +568,34 @@ class FedifServer(FedavgServer):
         t = getattr(self.clients[cid], "task", None)
         return (m == "img+txt") or (t in ("img+txt", "retrieval", "rtv"))
 
+    def _client_trust(self, cid: int) -> float:
+        """
+        噪声感知信任度：
+        - noisy client 自动降权，但保留最小探索权重
+        """
+        if not bool(getattr(self.args, "fedif_noise_aware", True)):
+            return 1.0
+
+        gamma = float(getattr(self.clients[cid], "noise_gamma", 0.0))
+        penalty = float(getattr(self.args, "fedif_noise_penalty", 1.5))
+        floor = float(getattr(self.args, "fedif_trust_floor", 0.2))
+
+        trust = 1.0 / (1.0 + penalty * max(gamma, 0.0))
+        return max(floor, min(1.0, trust))
+
+    def _clip_client_delta(self, delta: torch.Tensor, base: torch.Tensor, cid: int) -> torch.Tensor:
+        max_scale = float(getattr(self.args, "fedif_delta_clip", 0.0))
+        if max_scale <= 0:
+            return delta
+
+        ref = base.norm() / np.sqrt(max(float(base.numel()), 1.0))
+        trust = self._client_trust(cid)
+        max_norm = max_scale * trust * (ref + 1e-12)
+        dn = delta.norm()
+        if dn > max_norm:
+            delta = delta * (max_norm / (dn + 1e-12))
+        return delta
+
     def _map_param_to_mm_key(self, param_name: str, check_grads: dict = None) -> str:
         """
         把参数名映射到 mm_model 的 key，用于从某个梯度字典里取 golden grad。
@@ -865,6 +893,7 @@ class FedifServer(FedavgServer):
 
                     local = local_sd[param_name].to(torch.float32)
                     delta = local - base
+                    delta = self._clip_client_delta(delta, base, cid)
 
                     # -------- 3) 只对分类 client 做多约束投影（检索优先 hard -> 分类 soft）--------
                     if self._is_cls_client(cid):
@@ -886,6 +915,7 @@ class FedifServer(FedavgServer):
                     influence = float(self.client_influence.get(cid, 1.0))
                     if influence < 0:
                         influence = 0.0
+                    influence *= self._client_trust(cid)
 
                     # fisher（客户端提供；缺失则用 1）
                     f = self._get_client_fisher(cid, param_name, like=base)
